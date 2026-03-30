@@ -394,6 +394,25 @@ class RakutenScraper(BaseScraper):
             if body_node:
                 body = clean_text(body_node.get_text(" ", strip=True))
 
+            title = ""
+            for cand in item.select("div"):
+                txt = clean_text(cand.get_text(" ", strip=True))
+                if not txt:
+                    continue
+                if txt == body:
+                    continue
+                if txt.startswith("商品:"):
+                    continue
+                if txt.startswith("注文日"):
+                    continue
+                if parse_date(txt):
+                    continue
+                if txt in {"さらに表示", "参考になった", "不適切レビュー報告"}:
+                    continue
+                if len(txt) <= 80:
+                    title = txt
+                    break
+
             # タイトルが無いレビューもあるので空でも許容
             if not body:
                 continue
