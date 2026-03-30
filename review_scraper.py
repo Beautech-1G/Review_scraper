@@ -124,9 +124,15 @@ def star_to_str(v):
 
 
 def fetch(session, url):
-    r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.text
+    for i in range(3):  # 3回リトライ
+        try:
+            r = session.get(url, headers=HEADERS, timeout=60)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            print(f"[WARN] fetch失敗 {i+1}回目: {e}")
+            time.sleep(3)
+    raise Exception("fetch失敗")
 
 
 class BaseScraper:
@@ -329,9 +335,13 @@ def main():
                 scraper = SCRAPER_MAP[m["scraper"]](
                     m["mall"], p["product_name"], m["url"], session
                 )
-                reviews = scraper.scrape()
-                all_reviews.extend(reviews)
-                print(f"{m['mall']}：{len(reviews)}件")
+                try:
+                    reviews = scraper.scrape()
+                    all_reviews.extend(reviews)
+                    print(f"{m['mall']}：{len(reviews)}件")
+                except Exception as e:
+                    print(f"[ERROR] {m['mall']} 失敗: {e}")
+                    continue
 
     write_reviews(all_reviews)
 
