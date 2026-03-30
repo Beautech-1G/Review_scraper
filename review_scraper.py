@@ -33,6 +33,8 @@ HEADERS = {
     "Pragma": "no-cache",
 }
 
+ORDER_DATE_RE = re.compile(r"注文日[:：]\s*(20\d{2}[/-]\d{1,2}[/-]\d{1,2})")
+
 PRODUCTS = [
     {
         "product_name": "ReFa FINE BUBBLE U+",
@@ -107,14 +109,6 @@ def jst_today_str() -> str:
 
 
 def normalize_text(text: str) -> str:
-    """
-    重複判定用の正規化
-    1. HTMLエンティティ解除
-    2. Unicode NFKC 正規化
-    3. 改行/タブ/連続空白を半角1スペースへ圧縮
-    4. 前後空白除去
-    5. 英字小文字化
-    """
     if text is None:
         return ""
     text = html.unescape(text)
@@ -157,12 +151,27 @@ def normalize_order_date_text(text: str) -> str:
     d = parse_date(text)
     if d:
         return f"注文日：{fmt_date(d)}"
-    if text.startswith("注文日："):
-        suffix = text.replace("注文日：", "", 1).strip()
+    if text.startswith("注文日：") or text.startswith("注文日:"):
+        suffix = re.sub(r"^注文日[:：]\s*", "", text)
         d = parse_date(suffix)
         if d:
             return f"注文日：{fmt_date(d)}"
     return text
+
+
+def extract_order_date_from_text(text: str) -> Tuple[str, str]:
+    text = clean_text(text)
+    if not text:
+        return "", ""
+    m = ORDER_DATE_RE.search(text)
+    if not m:
+        return text, ""
+    d = parse_date(m.group(1))
+    order_date = f"注文日：{fmt_date(d)}" if d else ""
+    cleaned = ORDER_DATE_RE.sub("", text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ：:　")
+    cleaned = clean_text(cleaned)
+    return cleaned, order_date
 
 
 def star_to_str(value: Optional[float]) -> str:
@@ -263,9 +272,15 @@ class BaseScraper:
         title: str,
         body: str,
     ) -> Review:
-        order_date = normalize_order_date_text(order_date)
         title = clean_text(title)
         body = clean_text(body)
+        order_date = normalize_order_date_text(order_date)
+
+        title, order_from_title = extract_order_date_from_text(title)
+        body, order_from_body = extract_order_date_from_text(body)
+
+        if not order_date:
+            order_date = order_from_title or order_from_body
 
         return Review(
             run_date=jst_today_str(),
@@ -351,7 +366,7 @@ class RakutenScraper(BaseScraper):
                             j += 1
                             continue
 
-                        if txt.startswith("注文日："):
+                        if txt.startswith("注文日：") or txt.startswith("注文日:"):
                             order_date = txt
                             j += 1
                             continue
@@ -443,7 +458,7 @@ class YahooScraper(BaseScraper):
                         if txt in {"購入した商品", "購入したストア"} or txt.startswith("違反報告") or txt.startswith("いいね"):
                             j += 1
                             continue
-                        if txt.startswith("注文日："):
+                        if txt.startswith("注文日：") or txt.startswith("注文日:"):
                             order_date = txt
                             j += 1
                             continue
@@ -584,7 +599,7 @@ class BicCameraScraper(BaseScraper):
                 probe = lines[j]
                 if parse_date(probe):
                     break
-                if probe.startswith("注文日："):
+                if probe.startswith("注文日：") or probe.startswith("注文日:"):
                     order_date = probe
                     j += 1
                     continue
