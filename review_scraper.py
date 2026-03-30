@@ -70,7 +70,8 @@ CSV_HEADERS = [
     "ページURL",
     "口コミ投稿日",
     "星の数",
-    "口コミタイトル",
+    "注文日",
+    "口コミのタイトル",
     "口コミ全文",
 ]
 
@@ -83,6 +84,7 @@ class Review:
     page_url: str
     review_date: str
     stars: str
+    order_date: str
     title: str
     body: str
 
@@ -94,6 +96,7 @@ class Review:
             self.page_url,
             self.review_date,
             self.stars,
+            self.order_date,
             self.title,
             self.body,
         ]
@@ -105,13 +108,12 @@ def jst_today_str() -> str:
 
 def normalize_text(text: str) -> str:
     """
-    正規化定義（重複判定用）
+    重複判定用の正規化
     1. HTMLエンティティ解除
     2. Unicode NFKC 正規化
-    3. 改行/タブ/全角半角スペースの連続を半角1スペースへ圧縮
+    3. 改行/タブ/連続空白を半角1スペースへ圧縮
     4. 前後空白除去
-    5. 英字のみ小文字化
-    ※句読点は残す
+    5. 英字小文字化
     """
     if text is None:
         return ""
@@ -148,6 +150,21 @@ def clean_text(text: str) -> str:
     return text
 
 
+def normalize_order_date_text(text: str) -> str:
+    text = clean_text(text)
+    if not text:
+        return ""
+    d = parse_date(text)
+    if d:
+        return f"注文日：{fmt_date(d)}"
+    if text.startswith("注文日："):
+        suffix = text.replace("注文日：", "", 1).strip()
+        d = parse_date(suffix)
+        if d:
+            return f"注文日：{fmt_date(d)}"
+    return text
+
+
 def star_to_str(value: Optional[float]) -> str:
     if value is None:
         return ""
@@ -179,7 +196,8 @@ def load_existing_reviews() -> Tuple[List[Review], Dict[str, set]]:
                     page_url=row.get("ページURL", ""),
                     review_date=row.get("口コミ投稿日", ""),
                     stars=row.get("星の数", ""),
-                    title=row.get("口コミタイトル", ""),
+                    order_date=row.get("注文日", ""),
+                    title=row.get("口コミのタイトル", ""),
                     body=row.get("口コミ全文", ""),
                 )
                 rows.append(review)
@@ -236,7 +254,19 @@ class BaseScraper:
     def scrape(self) -> List[Review]:
         raise NotImplementedError
 
-    def make_review(self, page_url: str, review_date: date, stars: Optional[float], title: str, body: str) -> Review:
+    def make_review(
+        self,
+        page_url: str,
+        review_date: date,
+        stars: Optional[float],
+        order_date: str,
+        title: str,
+        body: str,
+    ) -> Review:
+        order_date = normalize_order_date_text(order_date)
+        title = clean_text(title)
+        body = clean_text(body)
+
         return Review(
             run_date=jst_today_str(),
             mall=self.mall,
@@ -244,8 +274,9 @@ class BaseScraper:
             page_url=page_url,
             review_date=fmt_date(review_date),
             stars=star_to_str(stars),
-            title=clean_text(title),
-            body=clean_text(body),
+            order_date=order_date,
+            title=title,
+            body=body,
         )
 
 
@@ -306,26 +337,38 @@ class RakutenScraper(BaseScraper):
                 if d:
                     stars = float(star_match.group(1))
                     title = ""
-                    body = ""
+                    body_parts: List[str] = []
+                    order_date = ""
+
                     j = i + 2
                     while j < len(lines):
                         txt = lines[j]
+
                         if re.fullmatch(r"([1-5](?:\.0)?)", txt) and j + 1 < len(lines) and parse_date(lines[j + 1]):
                             break
-                        if txt.startswith("注文日："):
-                            break
+
                         if txt in {"さらに表示", "参考になった", "不適切レビュー報告"}:
                             j += 1
                             continue
-                        if title == "" and len(txt) <= 80 and not re.search(r"さん$|代$|男性$|女性$|商品:|購入者さん$", txt):
+
+                        if txt.startswith("注文日："):
+                            order_date = txt
+                            j += 1
+                            continue
+
+                        if txt in {"家族へ", "自分用", "友人へ", "はじめて", "実用品・普段使い", "プレゼント", "ギフト"}:
+                            j += 1
+                            continue
+
+                        if title == "" and len(txt) <= 80 and not re.search(r"さん$|代$|男性$|女性$|購入者さん$", txt):
                             title = txt
-                        elif not body and not re.search(r"さん$|代$|男性$|女性$|商品:|家族へ|実用品|はじめて|注文日：", txt):
-                            body = txt
-                        elif body and not re.search(r"注文日：", txt):
-                            body = f"{body} {txt}"
+                        else:
+                            body_parts.append(txt)
+
                         j += 1
-                    if title or body:
-                        reviews.append(self.make_review(page_url, d, stars, title, body))
+
+                    body = " ".join(body_parts).strip()
+                    reviews.append(self.make_review(page_url, d, stars, order_date, title, body))
                     i = j
                     continue
             i += 1
@@ -391,6 +434,8 @@ class YahooScraper(BaseScraper):
                     stars = float(m.group(1)) if m else None
                     j = i + 3
                     body_parts: List[str] = []
+                    order_date = ""
+
                     while j < len(lines):
                         txt = lines[j]
                         if j + 2 < len(lines) and parse_date(lines[j + 1]) and re.match(r"^[0-5](?:\.\d)?[^\d]?.*さん", lines[j + 2]):
@@ -398,13 +443,18 @@ class YahooScraper(BaseScraper):
                         if txt in {"購入した商品", "購入したストア"} or txt.startswith("違反報告") or txt.startswith("いいね"):
                             j += 1
                             continue
+                        if txt.startswith("注文日："):
+                            order_date = txt
+                            j += 1
+                            continue
                         if re.match(r"^(カラー|<商品名>|<カラー>|<商品名>)/", txt):
                             j += 1
                             continue
                         body_parts.append(txt)
                         j += 1
+
                     body = " ".join(body_parts).strip()
-                    reviews.append(self.make_review(page_url, d, stars, title, body))
+                    reviews.append(self.make_review(page_url, d, stars, order_date, title, body))
                     i = j
                     continue
             i += 1
@@ -442,12 +492,13 @@ class AmazonScraper(BaseScraper):
                 date_text = clean_text(_node_text(node.select_one("[data-hook='review-date']")))
                 review_dt = parse_date(date_text)
                 stars = parse_star_text(_node_text(node.select_one("[data-hook='review-star-rating'], [data-hook='cmps-review-star-rating']")))
+                order_date = ""
                 if review_dt is None:
                     continue
                 if review_dt < CUTOFF_DATE:
                     return results
 
-                review = self.make_review(page_url, review_dt, stars, title, body)
+                review = self.make_review(page_url, review_dt, stars, order_date, title, body)
                 key = build_dedupe_key(review.mall, review.review_date, review.body)
                 if key and key in self.seen_keys:
                     old_seen_on_page = True
@@ -525,6 +576,7 @@ class BicCameraScraper(BaseScraper):
             next_line = lines[i + 1] if i + 1 < len(lines) else ""
             star_match = re.match(r"^([0-5](?:\.\d)?)$", next_line)
             stars = float(star_match.group(1)) if star_match else None
+            order_date = ""
 
             body_parts: List[str] = []
             j = i + 2 if star_match else i + 1
@@ -532,6 +584,10 @@ class BicCameraScraper(BaseScraper):
                 probe = lines[j]
                 if parse_date(probe):
                     break
+                if probe.startswith("注文日："):
+                    order_date = probe
+                    j += 1
+                    continue
                 if len(probe) <= 2 and re.fullmatch(r"[0-5](?:\.\d)?", probe):
                     j += 1
                     continue
@@ -541,8 +597,7 @@ class BicCameraScraper(BaseScraper):
                 j += 1
 
             body = " ".join(body_parts).strip()
-            if title or body:
-                reviews.append(self.make_review(page_url, d, stars, title, body))
+            reviews.append(self.make_review(page_url, d, stars, order_date, title, body))
 
         return reviews
 
@@ -586,11 +641,21 @@ def main() -> int:
                     print(f"[ERROR] {mall}: {e}", file=sys.stderr)
                     continue
 
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    target_path = DATA_DIR / f"{TODAY_JST.year}_FBU+_Review.csv"
+    if not target_path.exists():
+        with target_path.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(CSV_HEADERS)
+
+    if all_reviews:
+        write_reviews(all_reviews)
+
     if new_count == 0:
         print("[INFO] 追加レビューなし")
         return 0
 
-    write_reviews(all_reviews)
     print(f"[INFO] 合計 {new_count} 件追加")
     return 0
 
