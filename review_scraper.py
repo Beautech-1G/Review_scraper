@@ -309,10 +309,9 @@ class RakutenScraper(BaseScraper):
                 break
 
             soup = BeautifulSoup(html_text, "html.parser")
-            lines = [clean_text(x) for x in soup.get_text("\n").split("\n")]
-            lines = [x for x in lines if x]
 
-            page_reviews = self._parse_from_lines(lines, page_url)
+            # 楽天はレビューカード要素から直接取得
+            page_reviews = self._parse_from_nodes(soup, page_url)
             if not page_reviews:
                 break
 
@@ -342,51 +341,65 @@ class RakutenScraper(BaseScraper):
 
         return results
 
-    def _parse_from_lines(self, lines: List[str], page_url: str) -> List[Review]:
+    def _parse_from_nodes(self, soup: BeautifulSoup, page_url: str) -> List[Review]:
         reviews: List[Review] = []
-        i = 0
-        while i < len(lines):
-            star_match = re.fullmatch(r"([1-5](?:\.0)?)", lines[i])
-            if star_match and i + 1 < len(lines):
-                d = parse_date(lines[i + 1])
-                if d:
-                    stars = float(star_match.group(1))
-                    title = ""
-                    body_parts: List[str] = []
-                    order_date = ""
 
-                    j = i + 2
-                    while j < len(lines):
-                        txt = lines[j]
+        # レビュー一覧のliを対象
+        review_nodes = soup.select("#itemReviewList > ul > li")
+        if not review_nodes:
+            review_nodes = soup.select("#itemReviewList li")
 
-                        if re.fullmatch(r"([1-5](?:\.0)?)", txt) and j + 1 < len(lines) and parse_date(lines[j + 1]):
-                            break
+        for item in review_nodes:
+            # 投稿日
+            review_date = ""
+            for div in item.select("div"):
+                txt = clean_text(div.get_text(" ", strip=True))
+                if parse_date(txt):
+                    review_date = txt
+                    break
+            d = parse_date(review_date)
+            if not d:
+                continue
 
-                        if txt in {"さらに表示", "参考になった", "不適切レビュー報告"}:
-                            j += 1
-                            continue
+            # 星
+            stars = None
+            star_text = ""
+            for span in item.select("span"):
+                txt = clean_text(span.get_text(" ", strip=True))
+                if re.fullmatch(r"[1-5](?:\.\d+)?", txt):
+                    star_text = txt
+                    break
+            if star_text:
+                try:
+                    stars = float(star_text)
+                except ValueError:
+                    stars = None
 
-                        if txt.startswith("注文日：") or txt.startswith("注文日:"):
-                            order_date = txt
-                            j += 1
-                            continue
+            # 注文日
+            order_date = ""
+            order_node = item.find(string=re.compile(r"注文日[:：]\s*20\d{2}/\d{1,2}/\d{1,2}"))
+            if order_node:
+                order_date = clean_text(str(order_node))
 
-                        if txt in {"家族へ", "自分用", "友人へ", "はじめて", "実用品・普段使い", "プレゼント", "ギフト"}:
-                            j += 1
-                            continue
+            # タイトル
+            # 商品オプション行ではなく、レビュー本文直前の見出しを取得
+            title = ""
+            title_node = item.select_one("div.type-header--1Weg4")
+            if title_node:
+                title = clean_text(title_node.get_text(" ", strip=True))
 
-                        if title == "" and len(txt) <= 80 and not re.search(r"さん$|代$|男性$|女性$|購入者さん$", txt):
-                            title = txt
-                        else:
-                            body_parts.append(txt)
+            # 本文
+            body = ""
+            body_node = item.select_one("div.review-body--LpVR4")
+            if body_node:
+                body = clean_text(body_node.get_text(" ", strip=True))
 
-                        j += 1
+            # タイトルが無いレビューもあるので空でも許容
+            if not body:
+                continue
 
-                    body = " ".join(body_parts).strip()
-                    reviews.append(self.make_review(page_url, d, stars, order_date, title, body))
-                    i = j
-                    continue
-            i += 1
+            reviews.append(self.make_review(page_url, d, stars, order_date, title, body))
+
         return reviews
 
 
