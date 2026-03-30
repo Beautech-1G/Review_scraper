@@ -150,13 +150,13 @@ def normalize_order_date_text(text: str) -> str:
         return ""
     d = parse_date(text)
     if d:
-        return f"注文日：{fmt_date(d)}"
+        return fmt_date(d)
     if text.startswith("注文日：") or text.startswith("注文日:"):
         suffix = re.sub(r"^注文日[:：]\s*", "", text)
         d = parse_date(suffix)
         if d:
-            return f"注文日：{fmt_date(d)}"
-    return text
+            return fmt_date(d)
+    return ""
 
 
 def extract_order_date_from_text(text: str) -> Tuple[str, str]:
@@ -167,7 +167,7 @@ def extract_order_date_from_text(text: str) -> Tuple[str, str]:
     if not m:
         return text, ""
     d = parse_date(m.group(1))
-    order_date = f"注文日：{fmt_date(d)}" if d else ""
+    order_date = fmt_date(d) if d else ""
     cleaned = ORDER_DATE_RE.sub("", text)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" ：:　")
     cleaned = clean_text(cleaned)
