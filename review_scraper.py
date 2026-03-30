@@ -252,6 +252,15 @@ def fetch(session: requests.Session, url: str) -> str:
     return resp.text
 
 
+def _node_text(node) -> str:
+    return node.get_text(" ", strip=True) if node else ""
+
+
+def parse_star_text(text: str) -> Optional[float]:
+    m = re.search(r"([0-5](?:\.\d)?)", text)
+    return float(m.group(1)) if m else None
+
+
 class BaseScraper:
     def __init__(self, mall: str, product_name: str, start_url: str, session: requests.Session, seen_keys: set):
         self.mall = mall
@@ -310,8 +319,15 @@ class RakutenScraper(BaseScraper):
 
             soup = BeautifulSoup(html_text, "html.parser")
 
-            # 楽天はレビューカード要素から直接取得
+            # まずカード単位で取得
             page_reviews = self._parse_from_nodes(soup, page_url)
+
+            # 0件なら旧ロジックにフォールバック
+            if not page_reviews:
+                lines = [clean_text(x) for x in soup.get_text("\n").split("\n")]
+                lines = [x for x in lines if x]
+                page_reviews = self._parse_from_lines(lines, page_url)
+
             if not page_reviews:
                 break
 
@@ -344,12 +360,17 @@ class RakutenScraper(BaseScraper):
     def _parse_from_nodes(self, soup: BeautifulSoup, page_url: str) -> List[Review]:
         reviews: List[Review] = []
 
-        # レビュー一覧のliを対象
-        review_nodes = soup.select("#itemReviewList > ul > li")
+        review_nodes = soup.select("#itemReviewList ul > li")
         if not review_nodes:
             review_nodes = soup.select("#itemReviewList li")
 
         for item in review_nodes:
+            # 本文
+            body_node = item.select_one("div.review-body--LpVR4")
+            body = clean_text(_node_text(body_node))
+            if not body:
+                continue
+
             # 投稿日
             review_date = ""
             for div in item.select("div"):
@@ -363,17 +384,14 @@ class RakutenScraper(BaseScraper):
 
             # 星
             stars = None
-            star_text = ""
             for span in item.select("span"):
                 txt = clean_text(span.get_text(" ", strip=True))
                 if re.fullmatch(r"[1-5](?:\.\d+)?", txt):
-                    star_text = txt
-                    break
-            if star_text:
-                try:
-                    stars = float(star_text)
-                except ValueError:
-                    stars = None
+                    try:
+                        stars = float(txt)
+                        break
+                    except ValueError:
+                        pass
 
             # 注文日
             order_date = ""
@@ -382,43 +400,66 @@ class RakutenScraper(BaseScraper):
                 order_date = clean_text(str(order_node))
 
             # タイトル
-            # 商品オプション行ではなく、レビュー本文直前の見出しを取得
             title = ""
             title_node = item.select_one("div.type-header--1Weg4")
             if title_node:
                 title = clean_text(title_node.get_text(" ", strip=True))
 
-            # 本文
-            body = ""
-            body_node = item.select_one("div.review-body--LpVR4")
-            if body_node:
-                body = clean_text(body_node.get_text(" ", strip=True))
-
-            title = ""
-            for cand in item.select("div"):
-                txt = clean_text(cand.get_text(" ", strip=True))
-                if not txt:
-                    continue
-                if txt == body:
-                    continue
-                if txt.startswith("商品:"):
-                    continue
-                if txt.startswith("注文日"):
-                    continue
-                if parse_date(txt):
-                    continue
-                if txt in {"さらに表示", "参考になった", "不適切レビュー報告"}:
-                    continue
-                if len(txt) <= 80:
-                    title = txt
-                    break
-
-            # タイトルが無いレビューもあるので空でも許容
-            if not body:
-                continue
-
+            # タイトルが取れない場合は空欄のまま許容
             reviews.append(self.make_review(page_url, d, stars, order_date, title, body))
 
+        return reviews
+
+    def _parse_from_lines(self, lines: List[str], page_url: str) -> List[Review]:
+        reviews: List[Review] = []
+        i = 0
+        while i < len(lines):
+            star_match = re.fullmatch(r"([1-5](?:\.0)?)", lines[i])
+            if star_match and i + 1 < len(lines):
+                d = parse_date(lines[i + 1])
+                if d:
+                    stars = float(star_match.group(1))
+                    title = ""
+                    body_parts: List[str] = []
+                    order_date = ""
+
+                    j = i + 2
+                    while j < len(lines):
+                        txt = lines[j]
+
+                        if re.fullmatch(r"([1-5](?:\.0)?)", txt) and j + 1 < len(lines) and parse_date(lines[j + 1]):
+                            break
+
+                        if txt in {"さらに表示", "参考になった", "不適切レビュー報告"}:
+                            j += 1
+                            continue
+
+                        if txt.startswith("注文日：") or txt.startswith("注文日:"):
+                            order_date = txt
+                            j += 1
+                            continue
+
+                        if txt.startswith("商品:"):
+                            j += 1
+                            continue
+
+                        if txt in {"家族へ", "自分用", "友人へ", "はじめて", "実用品・普段使い", "プレゼント", "ギフト"}:
+                            j += 1
+                            continue
+
+                        if title == "" and len(txt) <= 80 and not re.search(r"さん$|代$|男性$|女性$|購入者さん$", txt):
+                            title = txt
+                        else:
+                            body_parts.append(txt)
+
+                        j += 1
+
+                    body = " ".join(body_parts).strip()
+                    if body:
+                        reviews.append(self.make_review(page_url, d, stars, order_date, title, body))
+                    i = j
+                    continue
+            i += 1
         return reviews
 
 
@@ -655,15 +696,6 @@ SCRAPER_MAP = {
     "amazon": AmazonScraper,
     "biccamera": BicCameraScraper,
 }
-
-
-def _node_text(node) -> str:
-    return node.get_text(" ", strip=True) if node else ""
-
-
-def parse_star_text(text: str) -> Optional[float]:
-    m = re.search(r"([0-5](?:\.\d)?)", text)
-    return float(m.group(1)) if m else None
 
 
 def main() -> int:
