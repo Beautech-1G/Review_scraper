@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 JST = ZoneInfo("Asia/Tokyo")
 TODAY_JST = datetime.now(JST).date()
 CUTOFF_DATE = date(2026, 2, 1)
-DATA_DIR = Path("data")
+DATA_DIR = Path("review_csv")
 TIMEOUT = 30
 MAX_PAGES_PER_MALL = 120
 HEADERS = {
