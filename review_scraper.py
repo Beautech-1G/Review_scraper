@@ -30,7 +30,11 @@ HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
 }
+
+ORDER_DATE_RE = re.compile(r"注文日[:：]\s*(20\d{2}[/-]\d{1,2}[/-]\d{1,2})")
 
 PRODUCTS = [
     {
@@ -39,12 +43,12 @@ PRODUCTS = [
         "malls": [
             {
                 "mall": "楽天",
-                "url": "https://review.rakuten.co.jp/item/1/262320_10002177",
+                "url": "https://review.rakuten.co.jp/item/1/262320_10002177?sort=6#itemReviewList",
                 "scraper": "rakuten",
             },
             {
                 "mall": "Yahoo",
-                "url": "https://shopping.yahoo.co.jp/review/item/list?store_id=mtgec&page_key=1579320109",
+                "url": "https://shopping.yahoo.co.jp/review/item/list?store_id=mtgec&page_key=1579320109&sc_i=shopping-pc-web-list-ranking-crk01_01-rvw&sort=-latest",
                 "scraper": "yahoo",
             },
             {
@@ -57,7 +61,6 @@ PRODUCTS = [
 ]
 
 MALL_ORDER = {"楽天": 1, "Yahoo": 2, "ビックカメラ": 3}
-
 CSV_HEADERS = [
     "検索実行日",
     "モール名",
@@ -97,215 +100,608 @@ class Review:
         ]
 
 
-def jst_today_str():
+def jst_today_str() -> str:
     return TODAY_JST.strftime("%Y/%m/%d")
+
+
+def normalize_text(text: str) -> str:
+    if text is None:
+        return ""
+    text = html.unescape(text)
+    text = unicodedata.normalize("NFKC", text)
+    text = text.replace("\u3000", " ")
+    text = re.sub(r"[\t\r\n ]+", " ", text)
+    text = text.strip()
+    text = text.lower()
+    return text
+
+
+def parse_date(text: str) -> Optional[date]:
+    text = text.strip()
+    m = re.search(r"(20\d{2})[/-](\d{1,2})[/-](\d{1,2})", text)
+    if not m:
+        return None
+    y, mo, d = map(int, m.groups())
+    try:
+        return date(y, mo, d)
+    except ValueError:
+        return None
+
+
+def fmt_date(d: date) -> str:
+    return d.strftime("%Y/%m/%d")
 
 
 def clean_text(text: str) -> str:
     text = html.unescape(text or "")
     text = unicodedata.normalize("NFKC", text)
+    text = text.replace("\u3000", " ")
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
-def parse_date(text: str) -> Optional[date]:
-    m = re.search(r"(20\d{2})[/-](\d{1,2})[/-](\d{1,2})", text)
+def normalize_order_date_text(text: str) -> str:
+    text = clean_text(text)
+    if not text:
+        return ""
+    d = parse_date(text)
+    if d:
+        return fmt_date(d)
+    if text.startswith("注文日：") or text.startswith("注文日:"):
+        suffix = re.sub(r"^注文日[:：]\s*", "", text)
+        d = parse_date(suffix)
+        if d:
+            return fmt_date(d)
+    return ""
+
+
+def extract_order_date_from_text(text: str) -> Tuple[str, str]:
+    text = clean_text(text)
+    if not text:
+        return "", ""
+    m = ORDER_DATE_RE.search(text)
     if not m:
+        return text, ""
+    d = parse_date(m.group(1))
+    order_date = fmt_date(d) if d else ""
+    cleaned = ORDER_DATE_RE.sub("", text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ：:　")
+    cleaned = clean_text(cleaned)
+    return cleaned, order_date
+
+
+def star_to_str(value: Optional[float]) -> str:
+    if value is None:
+        return ""
+    if math.isclose(value, round(value)):
+        return str(int(round(value)))
+    return str(value)
+
+
+def build_dedupe_key(mall: str, review_date: str, body: str) -> Optional[Tuple[str, str, str]]:
+    normalized_body = normalize_text(body)
+    if not normalized_body:
         return None
-    return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    return (mall, review_date, normalized_body)
 
 
-def fmt_date(d: date):
-    return d.strftime("%Y/%m/%d")
+def load_existing_reviews() -> Tuple[List[Review], Dict[str, set]]:
+    rows: List[Review] = []
+    seen_by_mall: Dict[str, set] = {}
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    for csv_path in DATA_DIR.glob("*_Review.csv"):
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                review = Review(
+                    run_date=row.get("検索実行日", ""),
+                    mall=row.get("モール名", ""),
+                    product_name=row.get("対象商品名", ""),
+                    page_url=row.get("ページURL", ""),
+                    review_date=row.get("口コミ投稿日", ""),
+                    stars=row.get("星の数", ""),
+                    order_date=row.get("注文日", ""),
+                    title=row.get("口コミのタイトル", ""),
+                    body=row.get("口コミ全文", ""),
+                )
+                rows.append(review)
+                key = build_dedupe_key(review.mall, review.review_date, review.body)
+                if key:
+                    seen_by_mall.setdefault(review.mall, set()).add(key)
+
+    return rows, seen_by_mall
 
 
-def star_to_str(v):
-    return str(int(v)) if v else ""
+def write_reviews(reviews: List[Review]) -> List[Path]:
+    by_year: Dict[int, List[Review]] = {}
+    for review in reviews:
+        d = parse_date(review.review_date)
+        if d is None:
+            continue
+        by_year.setdefault(d.year, []).append(review)
+
+    written_files: List[Path] = []
+    for year, year_reviews in sorted(by_year.items()):
+        path = DATA_DIR / f"{year}_FBU+_Review.csv"
+        year_reviews.sort(
+            key=lambda r: (
+                MALL_ORDER.get(r.mall, 999),
+                parse_date(r.review_date) or date(1900, 1, 1),
+                r.title,
+                normalize_text(r.body),
+            )
+        )
+        with path.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(CSV_HEADERS)
+            for review in year_reviews:
+                writer.writerow(review.row())
+        written_files.append(path)
+
+    return written_files
 
 
-def fetch(session, url):
-    for i in range(3):  # 3回リトライ
+def fetch(session: requests.Session, url: str) -> str:
+    last_error = None
+    for i in range(3):
         try:
-            r = session.get(url, headers=HEADERS, timeout=60)
-            r.raise_for_status()
-            return r.text
+            resp = session.get(url, timeout=TIMEOUT, headers=HEADERS)
+            resp.raise_for_status()
+            return resp.text
         except Exception as e:
-            print(f"[WARN] fetch失敗 {i+1}回目: {e}")
+            last_error = e
+            print(f"[WARN] fetch失敗 {i + 1}回目: {url} / {e}", file=sys.stderr)
             time.sleep(3)
-    raise Exception("fetch失敗")
+    raise last_error if last_error else Exception("fetch失敗")
+
+
+def _node_text(node) -> str:
+    return node.get_text(" ", strip=True) if node else ""
+
+
+def parse_star_text(text: str) -> Optional[float]:
+    m = re.search(r"([0-5](?:\.\d)?)", text)
+    return float(m.group(1)) if m else None
 
 
 class BaseScraper:
-    def __init__(self, mall, product_name, start_url, session):
+    def __init__(self, mall: str, product_name: str, start_url: str, session: requests.Session, seen_keys: set):
         self.mall = mall
         self.product_name = product_name
         self.start_url = start_url
         self.session = session
+        self.seen_keys = seen_keys
 
-    def make_review(self, page_url, d, stars, title, body):
+    def scrape(self) -> List[Review]:
+        raise NotImplementedError
+
+    def make_review(
+        self,
+        page_url: str,
+        review_date: date,
+        stars: Optional[float],
+        order_date: str,
+        title: str,
+        body: str,
+    ) -> Review:
+        title = clean_text(title)
+        body = clean_text(body)
+        order_date = normalize_order_date_text(order_date)
+
+        title, order_from_title = extract_order_date_from_text(title)
+        body, order_from_body = extract_order_date_from_text(body)
+
+        if not order_date:
+            order_date = order_from_title or order_from_body
+
         return Review(
-            jst_today_str(),
-            self.mall,
-            self.product_name,
-            page_url,
-            fmt_date(d),
-            star_to_str(stars),
-            "",  # 注文日は空欄固定
-            clean_text(title),
-            clean_text(body),
+            run_date=jst_today_str(),
+            mall=self.mall,
+            product_name=self.product_name,
+            page_url=page_url,
+            review_date=fmt_date(review_date),
+            stars=star_to_str(stars),
+            order_date=order_date,
+            title=title,
+            body=body,
         )
 
 
-# =========================
-# Yahoo（DOM抽出）
-# =========================
-class YahooScraper(BaseScraper):
-    def scrape(self):
-        results = []
-
-        for page in range(1, MAX_PAGES_PER_MALL + 1):
-            url = f"{self.start_url}&page={page}"
-            html = fetch(self.session, url)
-            soup = BeautifulSoup(html, "html.parser")
-
-            cards = soup.select("div.style_ReviewDetail__")
-
-            if not cards:
-                break
-
-            for c in cards:
-                title = c.select_one("p.style_ReviewDetail__reviewTitle__")
-                body = c.select_one("p.style_ReviewDetail__reviewBody__")
-                date_el = c.select_one("p.style_ReviewDetail__postedTime__")
-                star_el = c.select_one("span.Review__stars")
-
-                if not body or not date_el:
-                    continue
-
-                d = parse_date(date_el.get_text())
-                if not d or d < CUTOFF_DATE:
-                    return results
-
-                stars = None
-                if star_el and star_el.has_attr("aria-label"):
-                    m = re.search(r"(\d)", star_el["aria-label"])
-                    if m:
-                        stars = int(m.group(1))
-
-                results.append(
-                    self.make_review(
-                        url,
-                        d,
-                        stars,
-                        title.get_text() if title else "",
-                        body.get_text(),
-                    )
-                )
-
-            time.sleep(1)
-
-        return results
-
-
-# =========================
-# ビックカメラ（DOM抽出）
-# =========================
-class BicCameraScraper(BaseScraper):
-    def scrape(self):
-        results = []
-
-        for page in range(1, MAX_PAGES_PER_MALL + 1):
-            url = f"{self.start_url}&page={page}"
-            html = fetch(self.session, url)
-            soup = BeautifulSoup(html, "html.parser")
-
-            cards = soup.select("div.reviewBox")
-
-            if not cards:
-                break
-
-            for c in cards:
-                title = c.select_one("p.title")
-                body = c.select_one("p.content")
-
-                if not body:
-                    continue
-
-                text_all = c.get_text()
-
-                d = parse_date(text_all)
-                if not d or d < CUTOFF_DATE:
-                    return results
-
-                star_img = c.select_one("img[src*='review_']")
-                stars = None
-                if star_img:
-                    m = re.search(r"review_(\d)", star_img["src"])
-                    if m:
-                        stars = int(m.group(1))
-
-                results.append(
-                    self.make_review(
-                        url,
-                        d,
-                        stars,
-                        title.get_text() if title else "",
-                        body.get_text(),
-                    )
-                )
-
-            time.sleep(1)
-
-        return results
-
-
-# =========================
-# 楽天（そのまま）
-# =========================
 class RakutenScraper(BaseScraper):
-    def scrape(self):
-        results = []
+    def scrape(self) -> List[Review]:
+        results: List[Review] = []
+        is_initial = len(self.seen_keys) == 0
 
         for page in range(1, MAX_PAGES_PER_MALL + 1):
-            url = f"{self.start_url}?page={page}"
-            html = fetch(self.session, url)
-            soup = BeautifulSoup(html, "html.parser")
-
-            items = soup.select("#itemReviewList li")
-
-            if not items:
+            page_url = f"https://review.rakuten.co.jp/item/1/262320_10002177?sort=6&page={page}#itemReviewList"
+            try:
+                html_text = fetch(self.session, page_url)
+            except Exception as e:
+                print(f"[WARN] 楽天 page={page} fetch失敗: {e}", file=sys.stderr)
                 break
 
-            for i in items:
-                body = i.select_one("div.review-body--LpVR4")
-                if not body:
-                    continue
+            soup = BeautifulSoup(html_text, "html.parser")
 
-                d = parse_date(i.get_text())
-                if not d or d < CUTOFF_DATE:
+            page_reviews = self._parse_from_nodes(soup, page_url)
+            if not page_reviews:
+                lines = [clean_text(x) for x in soup.get_text("\n").split("\n")]
+                lines = [x for x in lines if x]
+                page_reviews = self._parse_from_lines(lines, page_url)
+
+            if not page_reviews:
+                break
+
+            added_this_page = 0
+            old_seen_on_page = False
+            for review in page_reviews:
+                review_dt = parse_date(review.review_date)
+                if review_dt is None:
+                    continue
+                if review_dt < CUTOFF_DATE:
                     return results
 
-                title = i.select_one("div.type-header--1Weg4")
+                key = build_dedupe_key(review.mall, review.review_date, review.body)
+                if key and key in self.seen_keys:
+                    old_seen_on_page = True
+                    continue
+                if key:
+                    self.seen_keys.add(key)
 
-                stars = None
-                for s in i.select("span"):
-                    if s.get_text().isdigit():
-                        stars = int(s.get_text())
-                        break
+                results.append(review)
+                added_this_page += 1
 
-                results.append(
-                    self.make_review(
-                        url,
-                        d,
-                        stars,
-                        title.get_text() if title else "",
-                        body.get_text(),
-                    )
-                )
+            if not is_initial and added_this_page == 0 and old_seen_on_page:
+                break
 
             time.sleep(1)
 
         return results
+
+    def _parse_from_nodes(self, soup: BeautifulSoup, page_url: str) -> List[Review]:
+        reviews: List[Review] = []
+
+        review_nodes = soup.select("#itemReviewList ul > li")
+        if not review_nodes:
+            review_nodes = soup.select("#itemReviewList li")
+
+        for item in review_nodes:
+            body_node = item.select_one("div.review-body--LpVR4")
+            body = clean_text(_node_text(body_node))
+            if not body:
+                continue
+
+            review_date = ""
+            for div in item.select("div"):
+                txt = clean_text(div.get_text(" ", strip=True))
+                if parse_date(txt):
+                    review_date = txt
+                    break
+            d = parse_date(review_date)
+            if not d:
+                continue
+
+            stars = None
+            for span in item.select("span"):
+                txt = clean_text(span.get_text(" ", strip=True))
+                if re.fullmatch(r"[1-5](?:\.\d+)?", txt):
+                    try:
+                        stars = float(txt)
+                        break
+                    except ValueError:
+                        pass
+
+            order_date = ""
+            order_node = item.find(string=re.compile(r"注文日[:：]\s*20\d{2}/\d{1,2}/\d{1,2}"))
+            if order_node:
+                order_date = clean_text(str(order_node))
+
+            title = ""
+            title_node = item.select_one("div.type-header--1Weg4")
+            if title_node:
+                title = clean_text(title_node.get_text(" ", strip=True))
+
+            reviews.append(self.make_review(page_url, d, stars, order_date, title, body))
+
+        return reviews
+
+    def _parse_from_lines(self, lines: List[str], page_url: str) -> List[Review]:
+        reviews: List[Review] = []
+        i = 0
+        while i < len(lines):
+            star_match = re.fullmatch(r"([1-5](?:\.0)?)", lines[i])
+            if star_match and i + 1 < len(lines):
+                d = parse_date(lines[i + 1])
+                if d:
+                    stars = float(star_match.group(1))
+                    title = ""
+                    body_parts: List[str] = []
+                    order_date = ""
+
+                    j = i + 2
+                    while j < len(lines):
+                        txt = lines[j]
+
+                        if re.fullmatch(r"([1-5](?:\.0)?)", txt) and j + 1 < len(lines) and parse_date(lines[j + 1]):
+                            break
+
+                        if txt in {"さらに表示", "参考になった", "不適切レビュー報告"}:
+                            j += 1
+                            continue
+
+                        if txt.startswith("注文日：") or txt.startswith("注文日:"):
+                            order_date = txt
+                            j += 1
+                            continue
+
+                        if txt.startswith("商品:"):
+                            j += 1
+                            continue
+
+                        if txt in {"家族へ", "自分用", "友人へ", "はじめて", "実用品・普段使い", "プレゼント", "ギフト"}:
+                            j += 1
+                            continue
+
+                        if title == "" and len(txt) <= 80 and not re.search(r"さん$|代$|男性$|女性$|購入者さん$", txt):
+                            title = txt
+                        else:
+                            body_parts.append(txt)
+
+                        j += 1
+
+                    body = " ".join(body_parts).strip()
+                    if body:
+                        reviews.append(self.make_review(page_url, d, stars, order_date, title, body))
+                    i = j
+                    continue
+            i += 1
+        return reviews
+
+
+class YahooScraper(BaseScraper):
+    def scrape(self) -> List[Review]:
+        results: List[Review] = []
+        is_initial = len(self.seen_keys) == 0
+
+        for page in range(1, MAX_PAGES_PER_MALL + 1):
+            page_url = f"https://shopping.yahoo.co.jp/review/item/list?store_id=mtgec&page_key=1579320109&sort=-latest&page={page}"
+            try:
+                html_text = fetch(self.session, page_url)
+            except Exception as e:
+                print(f"[WARN] Yahoo page={page} fetch失敗: {e}", file=sys.stderr)
+                break
+
+            soup = BeautifulSoup(html_text, "html.parser")
+            page_reviews = self._parse_from_nodes(soup, page_url)
+
+            if not page_reviews:
+                lines = [clean_text(x) for x in soup.get_text("\n").split("\n")]
+                lines = [x for x in lines if x]
+                page_reviews = self._parse_from_lines(lines, page_url)
+
+            if not page_reviews:
+                title = clean_text(soup.title.get_text(" ")) if soup.title else ""
+                print(f"[WARN] Yahoo page={page} レビュー抽出0件 title={title}", file=sys.stderr)
+                break
+
+            added_this_page = 0
+            old_seen_on_page = False
+            for review in page_reviews:
+                review_dt = parse_date(review.review_date)
+                if review_dt is None:
+                    continue
+                if review_dt < CUTOFF_DATE:
+                    return results
+
+                key = build_dedupe_key(review.mall, review.review_date, review.body)
+                if key and key in self.seen_keys:
+                    old_seen_on_page = True
+                    continue
+                if key:
+                    self.seen_keys.add(key)
+
+                results.append(review)
+                added_this_page += 1
+
+            if not is_initial and added_this_page == 0 and old_seen_on_page:
+                break
+
+            time.sleep(1)
+
+        return results
+
+    def _parse_from_nodes(self, soup: BeautifulSoup, page_url: str) -> List[Review]:
+        reviews: List[Review] = []
+
+        review_nodes = soup.select("div[class*='ReviewDetail']")
+        for item in review_nodes:
+            title_node = item.select_one("p[class*='reviewTitle']")
+            body_node = item.select_one("p[class*='reviewBody']")
+            date_node = item.select_one("p[class*='postedTime']")
+            star_node = item.select_one("span.Review__stars, span[class*='reviewStar']")
+
+            title = clean_text(_node_text(title_node))
+            body = clean_text(_node_text(body_node))
+            date_text = clean_text(_node_text(date_node))
+
+            if not body or not date_text:
+                continue
+
+            d = parse_date(date_text)
+            if not d:
+                continue
+
+            stars = None
+            if star_node and star_node.has_attr("aria-label"):
+                m = re.search(r"([0-5](?:\.\d)?)", star_node["aria-label"])
+                if m:
+                    stars = float(m.group(1))
+
+            reviews.append(self.make_review(page_url, d, stars, "", title, body))
+
+        return reviews
+
+    def _parse_from_lines(self, lines: List[str], page_url: str) -> List[Review]:
+        reviews: List[Review] = []
+        i = 0
+        while i < len(lines):
+            title = lines[i]
+            if i + 2 < len(lines):
+                d = parse_date(lines[i + 1])
+                star_author = lines[i + 2]
+                if d and re.match(r"^[0-5](?:\.\d)?[^\d]?.*さん", star_author):
+                    m = re.match(r"^([0-5](?:\.\d)?)", star_author)
+                    stars = float(m.group(1)) if m else None
+                    j = i + 3
+                    body_parts: List[str] = []
+                    order_date = ""
+
+                    while j < len(lines):
+                        txt = lines[j]
+                        if j + 2 < len(lines) and parse_date(lines[j + 1]) and re.match(r"^[0-5](?:\.\d)?[^\d]?.*さん", lines[j + 2]):
+                            break
+                        if txt in {"購入した商品", "購入したストア"} or txt.startswith("違反報告") or txt.startswith("いいね"):
+                            j += 1
+                            continue
+                        if txt.startswith("注文日：") or txt.startswith("注文日:"):
+                            order_date = txt
+                            j += 1
+                            continue
+                        if re.match(r"^(カラー|<商品名>|<カラー>|<商品名>)/", txt):
+                            j += 1
+                            continue
+                        body_parts.append(txt)
+                        j += 1
+
+                    body = " ".join(body_parts).strip()
+                    if body:
+                        reviews.append(self.make_review(page_url, d, stars, order_date, title, body))
+                    i = j
+                    continue
+            i += 1
+        return reviews
+
+
+class BicCameraScraper(BaseScraper):
+    def scrape(self) -> List[Review]:
+        results: List[Review] = []
+        is_initial = len(self.seen_keys) == 0
+
+        for page in range(1, MAX_PAGES_PER_MALL + 1):
+            page_url = f"https://www.biccamera.com/bc/disp/SfrGoodsPageReview.jsp?GOODS_NO=14676796&p={page}"
+            try:
+                html_text = fetch(self.session, page_url)
+            except Exception as e:
+                print(f"[WARN] ビックカメラ page={page} fetch失敗: {e}", file=sys.stderr)
+                break
+
+            soup = BeautifulSoup(html_text, "html.parser")
+            page_reviews = self._parse_from_nodes(soup, page_url)
+
+            if not page_reviews:
+                lines = [clean_text(x) for x in soup.get_text("\n").split("\n")]
+                lines = [x for x in lines if x]
+                page_reviews = self._parse_from_lines(lines, page_url)
+
+            if not page_reviews:
+                title = clean_text(soup.title.get_text(" ")) if soup.title else ""
+                print(f"[WARN] ビックカメラ page={page} レビュー抽出0件 title={title}", file=sys.stderr)
+                break
+
+            added_this_page = 0
+            old_seen_on_page = False
+            for review in page_reviews:
+                review_dt = parse_date(review.review_date)
+                if review_dt is None:
+                    continue
+                if review_dt < CUTOFF_DATE:
+                    return results
+
+                key = build_dedupe_key(review.mall, review.review_date, review.body)
+                if key and key in self.seen_keys:
+                    old_seen_on_page = True
+                    continue
+                if key:
+                    self.seen_keys.add(key)
+
+                results.append(review)
+                added_this_page += 1
+
+            if not is_initial and added_this_page == 0 and old_seen_on_page:
+                break
+
+            time.sleep(1)
+
+        return results
+
+    def _parse_from_nodes(self, soup: BeautifulSoup, page_url: str) -> List[Review]:
+        reviews: List[Review] = []
+
+        review_nodes = soup.select("div.bcs_item.bcs_review")
+        for item in review_nodes:
+            date_node = item.select_one("p.new_bcs_date")
+            title_node = item.select_one("dl dd")
+            body_node = item.select_one("p.content")
+            star_node = item.select_one("dl dt img[src*='review_']")
+
+            date_text = clean_text(_node_text(date_node))
+            title = clean_text(_node_text(title_node))
+            body = clean_text(_node_text(body_node))
+
+            if not body:
+                continue
+
+            m_date = re.search(r"20\d{2}/\d{1,2}/\d{1,2}", date_text or item.get_text(" ", strip=True))
+            d = parse_date(m_date.group(0)) if m_date else None
+            if not d:
+                continue
+
+            stars = None
+            if star_node and star_node.has_attr("src"):
+                m_star = re.search(r"review_(\d)", star_node["src"])
+                if m_star:
+                    stars = float(m_star.group(1))
+
+            reviews.append(self.make_review(page_url, d, stars, "", title, body))
+
+        return reviews
+
+    def _parse_from_lines(self, lines: List[str], page_url: str) -> List[Review]:
+        reviews: List[Review] = []
+        for i, txt in enumerate(lines):
+            d = parse_date(txt)
+            if not d:
+                continue
+
+            title = lines[i - 1] if i - 1 >= 0 else ""
+            next_line = lines[i + 1] if i + 1 < len(lines) else ""
+            star_match = re.match(r"^([0-5](?:\.\d)?)$", next_line)
+            stars = float(star_match.group(1)) if star_match else None
+            order_date = ""
+
+            body_parts: List[str] = []
+            j = i + 2 if star_match else i + 1
+            while j < len(lines):
+                probe = lines[j]
+                if parse_date(probe):
+                    break
+                if probe.startswith("注文日：") or probe.startswith("注文日:"):
+                    order_date = probe
+                    j += 1
+                    continue
+                if len(probe) <= 2 and re.fullmatch(r"[0-5](?:\.\d)?", probe):
+                    j += 1
+                    continue
+                if probe in {"参考になった", "このレビューは参考になりましたか？"}:
+                    break
+                body_parts.append(probe)
+                j += 1
+
+            body = " ".join(body_parts).strip()
+            if body:
+                reviews.append(self.make_review(page_url, d, stars, order_date, title, body))
+
+        return reviews
 
 
 SCRAPER_MAP = {
@@ -315,36 +711,46 @@ SCRAPER_MAP = {
 }
 
 
-def write_reviews(reviews):
-    DATA_DIR.mkdir(exist_ok=True)
-    path = DATA_DIR / f"{TODAY_JST.year}_Review.csv"
-
-    with path.open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(CSV_HEADERS)
-        for r in reviews:
-            writer.writerow(r.row())
-
-
-def main():
-    all_reviews = []
+def main() -> int:
+    existing_reviews, seen_by_mall = load_existing_reviews()
+    all_reviews = list(existing_reviews)
+    new_count = 0
 
     with requests.Session() as session:
-        for p in PRODUCTS:
-            for m in p["malls"]:
-                scraper = SCRAPER_MAP[m["scraper"]](
-                    m["mall"], p["product_name"], m["url"], session
-                )
+        for product in PRODUCTS:
+            product_name = product["product_name"]
+            for mall_conf in product["malls"]:
+                mall = mall_conf["mall"]
+                scraper_cls = SCRAPER_MAP[mall_conf["scraper"]]
+                seen_keys = seen_by_mall.setdefault(mall, set())
+                scraper = scraper_cls(mall, product_name, mall_conf["url"], session, seen_keys)
                 try:
                     reviews = scraper.scrape()
                     all_reviews.extend(reviews)
-                    print(f"{m['mall']}：{len(reviews)}件")
+                    new_count += len(reviews)
+                    print(f"[INFO] {mall}: {len(reviews)}件追加")
                 except Exception as e:
-                    print(f"[ERROR] {m['mall']} 失敗: {e}")
+                    print(f"[ERROR] {mall}: {e}", file=sys.stderr)
                     continue
 
-    write_reviews(all_reviews)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    target_path = DATA_DIR / f"{TODAY_JST.year}_FBU+_Review.csv"
+    if not target_path.exists():
+        with target_path.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(CSV_HEADERS)
+
+    if all_reviews:
+        write_reviews(all_reviews)
+
+    if new_count == 0:
+        print("[INFO] 追加レビューなし")
+        return 0
+
+    print(f"[INFO] 合計 {new_count} 件追加")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
