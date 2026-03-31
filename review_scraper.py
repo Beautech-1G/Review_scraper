@@ -51,16 +51,11 @@ PRODUCTS = [
                 "url": "https://shopping.yahoo.co.jp/review/item/list?store_id=mtgec&page_key=1579320109&sc_i=shopping-pc-web-list-ranking-crk01_01-rvw&sort=-latest",
                 "scraper": "yahoo",
             },
-            {
-                "mall": "ビックカメラ",
-                "url": "https://www.biccamera.com/bc/disp/SfrGoodsPageReview.jsp?GOODS_NO=14676796",
-                "scraper": "biccamera",
-            },
         ],
     }
 ]
 
-MALL_ORDER = {"楽天": 1, "Yahoo": 2, "ビックカメラ": 3}
+MALL_ORDER = {"楽天": 1, "Yahoo": 2}
 CSV_HEADERS = [
     "検索実行日",
     "モール名",
@@ -243,28 +238,13 @@ def write_reviews(reviews: List[Review]) -> List[Path]:
 
 
 def fetch(session: requests.Session, url: str) -> str:
-    is_bic = "biccamera.com" in url
-
-    headers = dict(HEADERS)
-    if is_bic:
-        headers.update({
-            "Referer": "https://www.biccamera.com/",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-        })
-
-    retry_count = 5 if is_bic else 3
-    timeout = 60 if is_bic else TIMEOUT
-    sleep_sec = 5 if is_bic else 3
-
     last_error = None
-    for i in range(retry_count):
+    for i in range(3):
         try:
             resp = session.get(
                 url,
-                timeout=timeout,
-                headers=headers,
+                timeout=TIMEOUT,
+                headers=HEADERS,
                 allow_redirects=True,
             )
             resp.raise_for_status()
@@ -272,18 +252,13 @@ def fetch(session: requests.Session, url: str) -> str:
         except Exception as e:
             last_error = e
             print(f"[WARN] fetch失敗 {i + 1}回目: {url} / {e}", file=sys.stderr)
-            time.sleep(sleep_sec)
+            time.sleep(3)
 
     raise last_error if last_error else Exception("fetch失敗")
 
 
 def _node_text(node) -> str:
     return node.get_text(" ", strip=True) if node else ""
-
-
-def parse_star_text(text: str) -> Optional[float]:
-    m = re.search(r"([0-5](?:\.\d)?)", text)
-    return float(m.group(1)) if m else None
 
 
 class BaseScraper:
@@ -539,7 +514,6 @@ class YahooScraper(BaseScraper):
             title_node = item.select_one("p[class*='reviewTitle']")
             body_node = item.select_one("p[class*='reviewBody']")
             date_node = item.select_one("p[class*='postedTime']")
-            star_node = item.select_one("span.Review__stars, span[class*='reviewStar']")
 
             title = clean_text(_node_text(title_node))
             body = clean_text(_node_text(body_node))
@@ -553,13 +527,13 @@ class YahooScraper(BaseScraper):
                 continue
 
             stars = None
-            
+
             star_node = item.select_one("span.Review__stars[role='img']")
             if star_node and star_node.has_attr("aria-label"):
                 m = re.search(r"5点中([0-5](?:\.\d)?)点", star_node["aria-label"])
                 if m:
                     stars = float(m.group(1))
-                    
+
             if stars is None:
                 star_text = clean_text(item.get_text(" ", strip=True))
                 m = re.search(r"5点中([0-5](?:\.\d)?)点の評価", star_text)
@@ -611,132 +585,9 @@ class YahooScraper(BaseScraper):
         return reviews
 
 
-class BicCameraScraper(BaseScraper):
-    def scrape(self) -> List[Review]:
-        results: List[Review] = []
-        is_initial = len(self.seen_keys) == 0
-
-        for page in range(1, MAX_PAGES_PER_MALL + 1):
-            page_url = f"https://www.biccamera.com/bc/disp/SfrGoodsPageReview.jsp?GOODS_NO=14676796&p={page}"
-            try:
-                html_text = fetch(self.session, page_url)
-            except Exception as e:
-                print(f"[WARN] ビックカメラ page={page} fetch失敗: {e}", file=sys.stderr)
-                break
-
-            soup = BeautifulSoup(html_text, "html.parser")
-            page_reviews = self._parse_from_nodes(soup, page_url)
-
-            if not page_reviews:
-                lines = [clean_text(x) for x in soup.get_text("\n").split("\n")]
-                lines = [x for x in lines if x]
-                page_reviews = self._parse_from_lines(lines, page_url)
-
-            if not page_reviews:
-                title = clean_text(soup.title.get_text(" ")) if soup.title else ""
-                print(f"[WARN] ビックカメラ page={page} レビュー抽出0件 title={title}", file=sys.stderr)
-                break
-
-            added_this_page = 0
-            old_seen_on_page = False
-            for review in page_reviews:
-                review_dt = parse_date(review.review_date)
-                if review_dt is None:
-                    continue
-                if review_dt < CUTOFF_DATE:
-                    return results
-
-                key = build_dedupe_key(review.mall, review.review_date, review.body)
-                if key and key in self.seen_keys:
-                    old_seen_on_page = True
-                    continue
-                if key:
-                    self.seen_keys.add(key)
-
-                results.append(review)
-                added_this_page += 1
-
-            if not is_initial and added_this_page == 0 and old_seen_on_page:
-                break
-
-            time.sleep(1)
-
-        return results
-
-    def _parse_from_nodes(self, soup: BeautifulSoup, page_url: str) -> List[Review]:
-        reviews: List[Review] = []
-
-        review_nodes = soup.select("div.bcs_item.bcs_review")
-        for item in review_nodes:
-            date_node = item.select_one("p.new_bcs_date")
-            title_node = item.select_one("dl dd")
-            body_node = item.select_one("p.content")
-            star_node = item.select_one("dl dt img[src*='review_']")
-
-            date_text = clean_text(_node_text(date_node))
-            title = clean_text(_node_text(title_node))
-            body = clean_text(_node_text(body_node))
-
-            if not body:
-                continue
-
-            m_date = re.search(r"20\d{2}/\d{1,2}/\d{1,2}", date_text or item.get_text(" ", strip=True))
-            d = parse_date(m_date.group(0)) if m_date else None
-            if not d:
-                continue
-
-            stars = None
-            if star_node and star_node.has_attr("src"):
-                m_star = re.search(r"review_(\d)", star_node["src"])
-                if m_star:
-                    stars = float(m_star.group(1))
-
-            reviews.append(self.make_review(page_url, d, stars, "", title, body))
-
-        return reviews
-
-    def _parse_from_lines(self, lines: List[str], page_url: str) -> List[Review]:
-        reviews: List[Review] = []
-        for i, txt in enumerate(lines):
-            d = parse_date(txt)
-            if not d:
-                continue
-
-            title = lines[i - 1] if i - 1 >= 0 else ""
-            next_line = lines[i + 1] if i + 1 < len(lines) else ""
-            star_match = re.match(r"^([0-5](?:\.\d)?)$", next_line)
-            stars = float(star_match.group(1)) if star_match else None
-            order_date = ""
-
-            body_parts: List[str] = []
-            j = i + 2 if star_match else i + 1
-            while j < len(lines):
-                probe = lines[j]
-                if parse_date(probe):
-                    break
-                if probe.startswith("注文日：") or probe.startswith("注文日:"):
-                    order_date = probe
-                    j += 1
-                    continue
-                if len(probe) <= 2 and re.fullmatch(r"[0-5](?:\.\d)?", probe):
-                    j += 1
-                    continue
-                if probe in {"参考になった", "このレビューは参考になりましたか？"}:
-                    break
-                body_parts.append(probe)
-                j += 1
-
-            body = " ".join(body_parts).strip()
-            if body:
-                reviews.append(self.make_review(page_url, d, stars, order_date, title, body))
-
-        return reviews
-
-
 SCRAPER_MAP = {
     "rakuten": RakutenScraper,
     "yahoo": YahooScraper,
-    "biccamera": BicCameraScraper,
 }
 
 
