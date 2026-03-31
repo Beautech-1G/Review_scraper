@@ -112,15 +112,23 @@ def normalize_text(text: str) -> str:
 
 
 def parse_date(text: str) -> Optional[date]:
-    text = text.strip()
-    m = re.search(r"(20\d{2})[/-](\d{1,2})[/-](\d{1,2})", text)
-    if not m:
-        return None
-    y, mo, d = map(int, m.groups())
-    try:
-        return date(y, mo, d)
-    except ValueError:
-        return None
+    text = clean_text(text)
+
+    patterns = [
+        r"(20\d{2})[/-](\d{1,2})[/-](\d{1,2})",
+        r"(20\d{2})年(\d{1,2})月(\d{1,2})日",
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            y, mo, d = map(int, m.groups())
+            try:
+                return date(y, mo, d)
+            except ValueError:
+                return None
+
+    return None
 
 
 def fmt_date(d: date) -> str:
