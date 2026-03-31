@@ -532,8 +532,16 @@ class YahooScraper(BaseScraper):
                 continue
 
             stars = None
+            
+            star_node = item.select_one("span.Review__stars[role='img']")
             if star_node and star_node.has_attr("aria-label"):
-                m = re.search(r"([0-5](?:\.\d)?)", star_node["aria-label"])
+                m = re.search(r"5点中([0-5](?:\.\d)?)点", star_node["aria-label"])
+                if m:
+                    stars = float(m.group(1))
+                    
+            if stars is None:
+                star_text = clean_text(item.get_text(" ", strip=True))
+                m = re.search(r"5点中([0-5](?:\.\d)?)点の評価", star_text)
                 if m:
                     stars = float(m.group(1))
 
