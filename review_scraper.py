@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 
 JST = ZoneInfo("Asia/Tokyo")
 TODAY_JST = datetime.now(JST).date()
-CUTOFF_DATE = date(2026, 2, 1)
+CUTOFF_DATE = date(2025, 12, 1)
 DATA_DIR = Path("review_csv")
 TIMEOUT = 30
 MAX_PAGES_PER_MALL = 120
@@ -243,16 +243,37 @@ def write_reviews(reviews: List[Review]) -> List[Path]:
 
 
 def fetch(session: requests.Session, url: str) -> str:
+    is_bic = "biccamera.com" in url
+
+    headers = dict(HEADERS)
+    if is_bic:
+        headers.update({
+            "Referer": "https://www.biccamera.com/",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+        })
+
+    retry_count = 5 if is_bic else 3
+    timeout = 60 if is_bic else TIMEOUT
+    sleep_sec = 5 if is_bic else 3
+
     last_error = None
-    for i in range(3):
+    for i in range(retry_count):
         try:
-            resp = session.get(url, timeout=TIMEOUT, headers=HEADERS)
+            resp = session.get(
+                url,
+                timeout=timeout,
+                headers=headers,
+                allow_redirects=True,
+            )
             resp.raise_for_status()
             return resp.text
         except Exception as e:
             last_error = e
             print(f"[WARN] fetch失敗 {i + 1}回目: {url} / {e}", file=sys.stderr)
-            time.sleep(3)
+            time.sleep(sleep_sec)
+
     raise last_error if last_error else Exception("fetch失敗")
 
 
