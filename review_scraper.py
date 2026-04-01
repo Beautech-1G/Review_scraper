@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -18,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 JST = ZoneInfo("Asia/Tokyo")
 TODAY_JST = datetime.now(JST).date()
-CUTOFF_DATE = date(2025, 12, 1)
+CUTOFF_DATE = date(TODAY_JST.year, 1, 1)
 DATA_DIR = Path("review_csv")
 TIMEOUT = 30
 MAX_PAGES_PER_MALL = 120
@@ -36,29 +37,40 @@ HEADERS = {
 
 ORDER_DATE_RE = re.compile(r"注文日[:：]\s*(20\d{2}[/-]\d{1,2}[/-]\d{1,2})")
 
+ALLOWED_CATEGORIES = {
+    "ドライヤー",
+    "アイロン",
+    "シャワー",
+    "脱毛器",
+    "美容機器",
+    "オーラル",
+}
+
+CATEGORY_ALIASES = {
+    "ドライヤ": "ドライヤー",
+}
+
 PRODUCTS = [
     {
+        "category": "シャワー",
         "product_name": "ReFa FINE BUBBLE U+",
-        "file_stub": "FBU+",
-        "malls": [
-            {
-                "mall": "楽天",
-                "url": "https://review.rakuten.co.jp/item/1/262320_10002177?sort=6#itemReviewList",
-                "scraper": "rakuten",
-            },
-            {
-                "mall": "Yahoo",
-                "url": "https://shopping.yahoo.co.jp/review/item/list?store_id=mtgec&page_key=1579320109&sc_i=shopping-pc-web-list-ranking-crk01_01-rvw&sort=-latest",
-                "scraper": "yahoo",
-            },
-        ],
-    }
+        "rakuten_url": "https://review.rakuten.co.jp/item/1/262320_10002177?sort=6#itemReviewList",
+        "yahoo_url": "https://shopping.yahoo.co.jp/review/item/list?store_id=mtgec&page_key=1579320109&sc_i=shopping-pc-web-list-ranking-crk01_01-rvw&sort=-latest",
+    },
+    # 追加例
+    # {
+    #     "category": "ドライヤー",
+    #     "product_name": "商品名",
+    #     "rakuten_url": "楽天口コミURL",
+    #     "yahoo_url": "Yahoo口コミURL",
+    # },
 ]
 
 MALL_ORDER = {"楽天": 1, "Yahoo": 2}
 CSV_HEADERS = [
     "検索実行日",
     "モール名",
+    "カテゴリ",
     "対象商品名",
     "ページURL",
     "口コミ投稿日",
@@ -73,6 +85,7 @@ CSV_HEADERS = [
 class Review:
     run_date: str
     mall: str
+    category: str
     product_name: str
     page_url: str
     review_date: str
@@ -85,6 +98,7 @@ class Review:
         return [
             self.run_date,
             self.mall,
+            self.category,
             self.product_name,
             self.page_url,
             self.review_date,
@@ -111,6 +125,20 @@ def normalize_text(text: str) -> str:
     return text
 
 
+def clean_text(text: str) -> str:
+    text = html.unescape(text or "")
+    text = unicodedata.normalize("NFKC", text)
+    text = text.replace("\u3000", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def normalize_category(category: str) -> str:
+    category = clean_text(category)
+    category = CATEGORY_ALIASES.get(category, category)
+    return category
+
+
 def parse_date(text: str) -> Optional[date]:
     text = clean_text(text)
 
@@ -133,14 +161,6 @@ def parse_date(text: str) -> Optional[date]:
 
 def fmt_date(d: date) -> str:
     return d.strftime("%Y/%m/%d")
-
-
-def clean_text(text: str) -> str:
-    text = html.unescape(text or "")
-    text = unicodedata.normalize("NFKC", text)
-    text = text.replace("\u3000", " ")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
 
 
 def normalize_order_date_text(text: str) -> str:
@@ -181,68 +201,96 @@ def star_to_str(value: Optional[float]) -> str:
     return str(value)
 
 
-def build_dedupe_key(mall: str, review_date: str, body: str) -> Optional[Tuple[str, str, str]]:
+def build_dedupe_key(
+    mall: str,
+    product_name: str,
+    review_date: str,
+    body: str,
+) -> Optional[Tuple[str, str, str, str]]:
     normalized_body = normalize_text(body)
-    if not normalized_body:
+    normalized_product_name = normalize_text(product_name)
+    if not normalized_body or not normalized_product_name:
         return None
-    return (mall, review_date, normalized_body)
+    return (mall, normalized_product_name, review_date, normalized_body)
 
 
-def load_existing_reviews() -> Tuple[List[Review], Dict[str, set]]:
+def category_csv_path(year: int, category: str) -> Path:
+    return DATA_DIR / f"{year}_{category}_Review.csv"
+
+
+def ensure_csv_exists(year: int, category: str) -> Path:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    path = category_csv_path(year, category)
+    if not path.exists():
+        with path.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(CSV_HEADERS)
+    return path
+
+
+def load_existing_reviews_for_category(year: int, category: str) -> Tuple[List[Review], Dict[str, set]]:
     rows: List[Review] = []
     seen_by_mall: Dict[str, set] = {}
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    for csv_path in DATA_DIR.glob("*_Review.csv"):
-        with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                review = Review(
-                    run_date=row.get("検索実行日", ""),
-                    mall=row.get("モール名", ""),
-                    product_name=row.get("対象商品名", ""),
-                    page_url=row.get("ページURL", ""),
-                    review_date=row.get("口コミ投稿日", ""),
-                    stars=row.get("星の数", ""),
-                    order_date=row.get("注文日", ""),
-                    title=row.get("口コミのタイトル", ""),
-                    body=row.get("口コミ全文", ""),
-                )
-                rows.append(review)
-                key = build_dedupe_key(review.mall, review.review_date, review.body)
-                if key:
-                    seen_by_mall.setdefault(review.mall, set()).add(key)
+    path = category_csv_path(year, category)
+    if not path.exists():
+        return rows, seen_by_mall
+
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            review = Review(
+                run_date=row.get("検索実行日", ""),
+                mall=row.get("モール名", ""),
+                category=normalize_category(row.get("カテゴリ", category) or category),
+                product_name=row.get("対象商品名", ""),
+                page_url=row.get("ページURL", ""),
+                review_date=row.get("口コミ投稿日", ""),
+                stars=row.get("星の数", ""),
+                order_date=row.get("注文日", ""),
+                title=row.get("口コミのタイトル", ""),
+                body=row.get("口コミ全文", ""),
+            )
+            rows.append(review)
+            key = build_dedupe_key(review.mall, review.product_name, review.review_date, review.body)
+            if key:
+                seen_by_mall.setdefault(review.mall, set()).add(key)
 
     return rows, seen_by_mall
 
 
-def write_reviews(reviews: List[Review]) -> List[Path]:
-    by_year: Dict[int, List[Review]] = {}
+def write_reviews_for_category(year: int, category: str, reviews: List[Review]) -> Path:
+    path = category_csv_path(year, category)
+
+    target_reviews: List[Review] = []
     for review in reviews:
         d = parse_date(review.review_date)
         if d is None:
             continue
-        by_year.setdefault(d.year, []).append(review)
+        if d.year != year:
+            continue
+        if normalize_category(review.category) != category:
+            continue
+        target_reviews.append(review)
 
-    written_files: List[Path] = []
-    for year, year_reviews in sorted(by_year.items()):
-        path = DATA_DIR / f"{year}_FBU+_Review.csv"
-        year_reviews.sort(
-            key=lambda r: (
-                MALL_ORDER.get(r.mall, 999),
-                parse_date(r.review_date) or date(1900, 1, 1),
-                r.title,
-                normalize_text(r.body),
-            )
+    target_reviews.sort(
+        key=lambda r: (
+            MALL_ORDER.get(r.mall, 999),
+            r.product_name,
+            parse_date(r.review_date) or date(1900, 1, 1),
+            r.title,
+            normalize_text(r.body),
         )
-        with path.open("w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(CSV_HEADERS)
-            for review in year_reviews:
-                writer.writerow(review.row())
-        written_files.append(path)
+    )
 
-    return written_files
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(CSV_HEADERS)
+        for review in target_reviews:
+            writer.writerow(review.row())
+
+    return path
 
 
 def fetch(session: requests.Session, url: str) -> str:
@@ -265,13 +313,33 @@ def fetch(session: requests.Session, url: str) -> str:
     raise last_error if last_error else Exception("fetch失敗")
 
 
+def build_paginated_url(base_url: str, page: int) -> str:
+    parts = urlsplit(base_url)
+    query_pairs = parse_qsl(parts.query, keep_blank_values=True)
+
+    filtered_pairs = [(k, v) for k, v in query_pairs if k != "page"]
+    filtered_pairs.append(("page", str(page)))
+
+    new_query = urlencode(filtered_pairs, doseq=True)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+
+
 def _node_text(node) -> str:
     return node.get_text(" ", strip=True) if node else ""
 
 
 class BaseScraper:
-    def __init__(self, mall: str, product_name: str, start_url: str, session: requests.Session, seen_keys: set):
+    def __init__(
+        self,
+        mall: str,
+        category: str,
+        product_name: str,
+        start_url: str,
+        session: requests.Session,
+        seen_keys: set,
+    ):
         self.mall = mall
+        self.category = category
         self.product_name = product_name
         self.start_url = start_url
         self.session = session
@@ -302,6 +370,7 @@ class BaseScraper:
         return Review(
             run_date=jst_today_str(),
             mall=self.mall,
+            category=self.category,
             product_name=self.product_name,
             page_url=page_url,
             review_date=fmt_date(review_date),
@@ -311,6 +380,18 @@ class BaseScraper:
             body=body,
         )
 
+    def is_old_review(self, review: Review) -> bool:
+        review_dt = parse_date(review.review_date)
+        return review_dt is None or review_dt < CUTOFF_DATE
+
+    def is_seen_review(self, review: Review) -> bool:
+        key = build_dedupe_key(review.mall, review.product_name, review.review_date, review.body)
+        if key and key in self.seen_keys:
+            return True
+        if key:
+            self.seen_keys.add(key)
+        return False
+
 
 class RakutenScraper(BaseScraper):
     def scrape(self) -> List[Review]:
@@ -318,7 +399,8 @@ class RakutenScraper(BaseScraper):
         is_initial = len(self.seen_keys) == 0
 
         for page in range(1, MAX_PAGES_PER_MALL + 1):
-            page_url = f"https://review.rakuten.co.jp/item/1/262320_10002177?sort=6&page={page}#itemReviewList"
+            page_url = build_paginated_url(self.start_url, page)
+
             try:
                 html_text = fetch(self.session, page_url)
             except Exception as e:
@@ -338,19 +420,14 @@ class RakutenScraper(BaseScraper):
 
             added_this_page = 0
             old_seen_on_page = False
+
             for review in page_reviews:
-                review_dt = parse_date(review.review_date)
-                if review_dt is None:
-                    continue
-                if review_dt < CUTOFF_DATE:
+                if self.is_old_review(review):
                     return results
 
-                key = build_dedupe_key(review.mall, review.review_date, review.body)
-                if key and key in self.seen_keys:
+                if self.is_seen_review(review):
                     old_seen_on_page = True
                     continue
-                if key:
-                    self.seen_keys.add(key)
 
                 results.append(review)
                 added_this_page += 1
@@ -381,6 +458,7 @@ class RakutenScraper(BaseScraper):
                 if parse_date(txt):
                     review_date = txt
                     break
+
             d = parse_date(review_date)
             if not d:
                 continue
@@ -468,7 +546,8 @@ class YahooScraper(BaseScraper):
         is_initial = len(self.seen_keys) == 0
 
         for page in range(1, MAX_PAGES_PER_MALL + 1):
-            page_url = f"https://shopping.yahoo.co.jp/review/item/list?store_id=mtgec&page_key=1579320109&sort=-latest&page={page}"
+            page_url = build_paginated_url(self.start_url, page)
+
             try:
                 html_text = fetch(self.session, page_url)
             except Exception as e:
@@ -490,19 +569,14 @@ class YahooScraper(BaseScraper):
 
             added_this_page = 0
             old_seen_on_page = False
+
             for review in page_reviews:
-                review_dt = parse_date(review.review_date)
-                if review_dt is None:
-                    continue
-                if review_dt < CUTOFF_DATE:
+                if self.is_old_review(review):
                     return results
 
-                key = build_dedupe_key(review.mall, review.review_date, review.body)
-                if key and key in self.seen_keys:
+                if self.is_seen_review(review):
                     old_seen_on_page = True
                     continue
-                if key:
-                    self.seen_keys.add(key)
 
                 results.append(review)
                 added_this_page += 1
@@ -599,44 +673,105 @@ SCRAPER_MAP = {
 }
 
 
+def build_product_configs() -> Dict[str, List[dict]]:
+    by_category: Dict[str, List[dict]] = {}
+
+    for product in PRODUCTS:
+        category = normalize_category(product.get("category", ""))
+        product_name = clean_text(product.get("product_name", ""))
+
+        if not product_name:
+            print("[WARN] 対象商品名が空のためスキップ", file=sys.stderr)
+            continue
+
+        if category not in ALLOWED_CATEGORIES:
+            print(f"[WARN] 対象外カテゴリのためスキップ: {category} / {product_name}", file=sys.stderr)
+            continue
+
+        by_category.setdefault(category, []).append(
+            {
+                "category": category,
+                "product_name": product_name,
+                "malls": [
+                    {
+                        "mall": "楽天",
+                        "url": clean_text(product.get("rakuten_url", "")),
+                        "scraper": "rakuten",
+                    },
+                    {
+                        "mall": "Yahoo",
+                        "url": clean_text(product.get("yahoo_url", "")),
+                        "scraper": "yahoo",
+                    },
+                ],
+            }
+        )
+
+    return by_category
+
+
 def main() -> int:
-    existing_reviews, seen_by_mall = load_existing_reviews()
-    all_reviews = list(existing_reviews)
-    new_count = 0
+    year = TODAY_JST.year
+    product_configs_by_category = build_product_configs()
 
-    with requests.Session() as session:
-        for product in PRODUCTS:
-            product_name = product["product_name"]
-            for mall_conf in product["malls"]:
-                mall = mall_conf["mall"]
-                scraper_cls = SCRAPER_MAP[mall_conf["scraper"]]
-                seen_keys = seen_by_mall.setdefault(mall, set())
-                scraper = scraper_cls(mall, product_name, mall_conf["url"], session, seen_keys)
-                try:
-                    reviews = scraper.scrape()
-                    all_reviews.extend(reviews)
-                    new_count += len(reviews)
-                    print(f"[INFO] {mall}: {len(reviews)}件追加")
-                except Exception as e:
-                    print(f"[ERROR] {mall}: {e}", file=sys.stderr)
-                    continue
-
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    target_path = DATA_DIR / f"{TODAY_JST.year}_FBU+_Review.csv"
-    if not target_path.exists():
-        with target_path.open("w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(CSV_HEADERS)
-
-    if all_reviews:
-        write_reviews(all_reviews)
-
-    if new_count == 0:
-        print("[INFO] 追加レビューなし")
+    if not product_configs_by_category:
+        print("[INFO] 対象商品なし")
         return 0
 
-    print(f"[INFO] 合計 {new_count} 件追加")
+    total_new_count = 0
+
+    with requests.Session() as session:
+        for category in sorted(product_configs_by_category.keys()):
+            ensure_csv_exists(year, category)
+
+            existing_reviews, seen_by_mall = load_existing_reviews_for_category(year, category)
+            category_reviews = list(existing_reviews)
+            category_new_count = 0
+
+            for product in product_configs_by_category[category]:
+                product_name = product["product_name"]
+
+                for mall_conf in product["malls"]:
+                    mall = mall_conf["mall"]
+                    url = mall_conf["url"]
+
+                    if not url:
+                        print(f"[WARN] URL未設定のためスキップ: {category} / {product_name} / {mall}", file=sys.stderr)
+                        continue
+
+                    scraper_cls = SCRAPER_MAP[mall_conf["scraper"]]
+                    seen_keys = seen_by_mall.setdefault(mall, set())
+                    scraper = scraper_cls(
+                        mall=mall,
+                        category=category,
+                        product_name=product_name,
+                        start_url=url,
+                        session=session,
+                        seen_keys=seen_keys,
+                    )
+
+                    try:
+                        reviews = scraper.scrape()
+                        category_reviews.extend(reviews)
+                        category_new_count += len(reviews)
+                        total_new_count += len(reviews)
+                        print(f"[INFO] {category} / {product_name} / {mall}: {len(reviews)}件追加")
+                    except Exception as e:
+                        print(f"[ERROR] {category} / {product_name} / {mall}: {e}", file=sys.stderr)
+                        continue
+
+            write_reviews_for_category(year, category, category_reviews)
+
+            if category_new_count == 0:
+                print(f"[INFO] {category}: 追加レビューなし")
+            else:
+                print(f"[INFO] {category}: 合計 {category_new_count} 件追加")
+
+    if total_new_count == 0:
+        print("[INFO] 全カテゴリで追加レビューなし")
+        return 0
+
+    print(f"[INFO] 全カテゴリ合計 {total_new_count} 件追加")
     return 0
 
 
