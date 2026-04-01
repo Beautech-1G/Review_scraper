@@ -57,7 +57,7 @@ PRODUCTS = [
         "rakuten_url": "https://review.rakuten.co.jp/item/1/262320_10002177?sort=6#itemReviewList",
         "yahoo_url": "https://shopping.yahoo.co.jp/review/item/list?store_id=mtgec&page_key=1579320109&sc_i=shopping-pc-web-list-ranking-crk01_01-rvw&sort=-latest",
     },
-    # 追加例
+    # 追加
     # {
     #     "category": "ドライヤー",
     #     "product_name": "商品名",
