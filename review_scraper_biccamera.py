@@ -22,8 +22,9 @@ CUTOFF_DATE = date(2025, 12, 1)
 DATA_DIR = Path("review_csv")
 
 PRODUCT_NAME = "ReFa FINE BUBBLE U+"
-START_URL = "https://www.biccamera.com/bc/disp/SfrGoodsPageReview.jsp?GOODS_NO=14676796"
 MALL_NAME = "ビックカメラ"
+START_URL = "https://www.biccamera.com/bc/disp/SfrGoodsPageReview.jsp?GOODS_NO=14676796"
+BASE_URL = "https://www.biccamera.com/"
 
 CSV_HEADERS = [
     "検索実行日",
@@ -299,25 +300,20 @@ def parse_review_from_block(block_text: str, page_url: str) -> Optional[Review]:
     if review_date_value < CUTOFF_DATE:
         return None
 
-    stars = ""
-    title = ""
-    body_parts: List[str] = []
-
     window_text = " ".join(lines[max(0, review_date_index - 3): min(len(lines), review_date_index + 4)])
     stars = extract_star(window_text)
 
     before_lines = [x for x in lines[:review_date_index] if parse_date(x) is None]
     after_lines = [x for x in lines[review_date_index + 1:] if parse_date(x) is None]
 
-    candidate_title = ""
+    title = ""
     if before_lines:
         for line in reversed(before_lines):
             if not extract_star(line) and 1 <= len(line) <= 80:
-                candidate_title = line
+                title = line
                 break
 
-    title = candidate_title
-
+    body_parts: List[str] = []
     for line in after_lines:
         if line == title:
             continue
@@ -328,7 +324,6 @@ def parse_review_from_block(block_text: str, page_url: str) -> Optional[Review]:
         body_parts.append(line)
 
     body = clean_text(" ".join(body_parts))
-
     if not body:
         return None
 
@@ -404,40 +399,97 @@ def get_next_page_url(page) -> Optional[str]:
     return None
 
 
+def goto_with_retry(page, url: str) -> None:
+    last_error: Optional[Exception] = None
+    wait_until_list = ["domcontentloaded", "load"]
+
+    for attempt in range(1, 4):
+        for wait_until in wait_until_list:
+            try:
+                print(f"[INFO] goto attempt={attempt} wait_until={wait_until} url={url}")
+                page.goto(url, wait_until=wait_until, timeout=60000)
+                page.wait_for_timeout(4000)
+                return
+            except PlaywrightTimeoutError as e:
+                last_error = e
+                print(f"[WARN] timeout attempt={attempt} wait_until={wait_until} url={url}", file=sys.stderr)
+                page.wait_for_timeout(2000)
+            except Exception as e:
+                last_error = e
+                print(
+                    f"[WARN] goto失敗 attempt={attempt} wait_until={wait_until} url={url} / {e}",
+                    file=sys.stderr,
+                )
+                page.wait_for_timeout(2000)
+
+    raise RuntimeError(f"ページ遷移失敗: {url} / {last_error}")
+
+
+def warmup_context(page) -> None:
+    try:
+        goto_with_retry(page, BASE_URL)
+    except Exception as e:
+        print(f"[WARN] warmup失敗: {e}", file=sys.stderr)
+
+
 def scrape_biccamera(seen_keys: Set[Tuple[str, str, str]]) -> List[Review]:
     results: List[Review] = []
     visited_urls: Set[str] = set()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-http2",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+            ],
+        )
+
         context = browser.new_context(
             locale="ja-JP",
             timezone_id="Asia/Tokyo",
+            ignore_https_errors=True,
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
+            viewport={"width": 1366, "height": 900},
         )
+
+        context.set_extra_http_headers(
+            {
+                "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+                "Upgrade-Insecure-Requests": "1",
+            }
+        )
+
         page = context.new_page()
 
         current_url = START_URL
         page_count = 0
+        success_page_count = 0
+
+        warmup_context(page)
 
         while current_url and current_url not in visited_urls:
             visited_urls.add(current_url)
             page_count += 1
 
+            print(f"[INFO] fetch page {page_count}: {current_url}")
+
             try:
-                print(f"[INFO] fetch page {page_count}: {current_url}")
-                page.goto(current_url, wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(3000)
-            except PlaywrightTimeoutError:
-                print(f"[WARN] timeout: {current_url}", file=sys.stderr)
-                break
+                goto_with_retry(page, current_url)
             except Exception as e:
-                print(f"[WARN] fetch失敗: {current_url} / {e}", file=sys.stderr)
-                break
+                context.close()
+                browser.close()
+                raise RuntimeError(f"ビックカメラ取得失敗: {e}")
+
+            success_page_count += 1
 
             html_text = page.content()
             reviews = parse_reviews_from_page(html_text, page.url)
@@ -445,6 +497,13 @@ def scrape_biccamera(seen_keys: Set[Tuple[str, str, str]]) -> List[Review]:
             if not reviews:
                 title = page.title()
                 print(f"[WARN] レビュー抽出0件 title={title} url={page.url}", file=sys.stderr)
+
+                # HTMLは取れたがレビューだけ拾えないケース
+                # 1ページ目で0件なら構造ずれの可能性が高いので失敗扱い
+                if page_count == 1:
+                    context.close()
+                    browser.close()
+                    raise RuntimeError(f"HTML取得は成功したがレビュー抽出0件: title={title} url={page.url}")
                 break
 
             added_this_page = 0
@@ -482,23 +541,24 @@ def scrape_biccamera(seen_keys: Set[Tuple[str, str, str]]) -> List[Review]:
         context.close()
         browser.close()
 
+        if success_page_count == 0:
+            raise RuntimeError("1ページも取得できていません")
+
     return results
 
 
 def main() -> int:
     existing_reviews, seen_by_mall = load_existing_reviews()
     all_reviews = list(existing_reviews)
-
     seen_keys = seen_by_mall.setdefault(MALL_NAME, set())
 
     try:
         new_reviews = scrape_biccamera(seen_keys)
     except Exception as e:
-        print(f"[ERROR] ビックカメラ取得失敗: {e}", file=sys.stderr)
+        print(f"[ERROR] {e}", file=sys.stderr)
         return 1
 
     all_reviews.extend(new_reviews)
-
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     if all_reviews:
