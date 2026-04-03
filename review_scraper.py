@@ -491,7 +491,7 @@ class RakutenScraper(BaseScraper):
         reviews: List[Review] = []
         i = 0
         while i < len(lines):
-            star_match = re.fullmatch(r"([1-5](?:\.0)?)", lines[i])
+            star_match = re.fullmatch(r"([1-5](?:\.\d{1,2})?)", lines[i])
             if star_match and i + 1 < len(lines):
                 d = parse_date(lines[i + 1])
                 if d:
@@ -504,7 +504,7 @@ class RakutenScraper(BaseScraper):
                     while j < len(lines):
                         txt = lines[j]
 
-                        if re.fullmatch(r"([1-5](?:\.0)?)", txt) and j + 1 < len(lines) and parse_date(lines[j + 1]):
+                        if re.fullmatch(r"([1-5](?:\.\d{1,2})?)", txt) and j + 1 < len(lines) and parse_date(lines[j + 1]):
                             break
 
                         if txt in {"さらに表示", "参考になった", "不適切レビュー報告"}:
@@ -612,13 +612,13 @@ class YahooScraper(BaseScraper):
 
             star_node = item.select_one("span.Review__stars[role='img']")
             if star_node and star_node.has_attr("aria-label"):
-                m = re.search(r"5点中([0-5](?:\.\d)?)点", star_node["aria-label"])
+                m = re.search(r"5点中([0-5](?:\.\d{1,2})?)点", star_node["aria-label"])
                 if m:
                     stars = float(m.group(1))
 
             if stars is None:
                 star_text = clean_text(item.get_text(" ", strip=True))
-                m = re.search(r"5点中([0-5](?:\.\d)?)点の評価", star_text)
+                m = re.search(r"5点中([0-5](?:\.\d{1,2})?)点の評価", star_text)
                 if m:
                     stars = float(m.group(1))
 
@@ -634,8 +634,8 @@ class YahooScraper(BaseScraper):
             if i + 2 < len(lines):
                 d = parse_date(lines[i + 1])
                 star_author = lines[i + 2]
-                if d and re.match(r"^[0-5](?:\.\d)?[^\d]?.*さん", star_author):
-                    m = re.match(r"^([0-5](?:\.\d)?)", star_author)
+                if d and re.match(r"^[0-5](?:\.\d{1,2})?[^\d]?.*さん", star_author):
+                    m = re.match(r"^([0-5](?:\.\d{1,2})?)", star_author)
                     stars = float(m.group(1)) if m else None
                     j = i + 3
                     body_parts: List[str] = []
