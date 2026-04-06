@@ -132,6 +132,28 @@ def clean_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
+def remove_rakuten_footer(text: str) -> str:
+    if not text:
+        return text
+
+    markers = [
+        "次へ お客様のご意見をお聞かせください",
+        "このページは役に立ちましたか",
+        "楽天市場の関連ジャンル",
+        "レビューに関するご注意",
+        "投稿ガイドライン",
+        "楽天ショッピングサービスご利用規約",
+        "楽天アフィリエイト",
+        "楽天市場トップ",
+        "© Rakuten Group, Inc.",
+    ]
+
+    for marker in markers:
+        idx = text.find(marker)
+        if idx != -1:
+            return text[:idx].strip()
+
+    return text
 
 def normalize_category(category: str) -> str:
     category = clean_text(category)
@@ -379,6 +401,7 @@ class BaseScraper:
     ) -> Review:
         title = clean_text(title)
         body = clean_text(body)
+        body = remove_rakuten_footer(body)
         order_date = normalize_order_date_text(order_date)
 
         title, order_from_title = extract_order_date_from_text(title)
