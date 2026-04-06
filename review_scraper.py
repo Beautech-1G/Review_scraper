@@ -206,12 +206,26 @@ def build_dedupe_key(
     product_name: str,
     review_date: str,
     body: str,
+    title: str = "",
 ) -> Optional[Tuple[str, str, str, str]]:
-    normalized_body = normalize_text(body)
     normalized_product_name = normalize_text(product_name)
-    if not normalized_body or not normalized_product_name:
+    normalized_title = normalize_text(title)
+    normalized_body = normalize_text(body)
+
+    if not normalized_product_name:
         return None
-    return (mall, normalized_product_name, review_date, normalized_body)
+
+    # タイトルがある場合はタイトル優先
+    if normalized_title:
+        key_text = normalized_title
+    else:
+        # タイトルが空なら本文先頭20文字
+        key_text = normalized_body[:20]
+
+    if not key_text:
+        return None
+
+    return (mall, normalized_product_name, review_date, key_text)
 
 
 def category_csv_path(year: int, category: str) -> Path:
@@ -253,7 +267,13 @@ def load_existing_reviews_for_category(year: int, category: str) -> Tuple[List[R
                 body=row.get("口コミ全文", ""),
             )
             rows.append(review)
-            key = build_dedupe_key(review.mall, review.product_name, review.review_date, review.body)
+            key = build_dedupe_key(
+                review.mall,
+                review.product_name,
+                review.review_date,
+                review.body,
+                review.title,
+            )
             if key:
                 seen_by_mall.setdefault(review.mall, set()).add(key)
 
@@ -385,7 +405,13 @@ class BaseScraper:
         return review_dt is None or review_dt < CUTOFF_DATE
 
     def is_seen_review(self, review: Review) -> bool:
-        key = build_dedupe_key(review.mall, review.product_name, review.review_date, review.body)
+        key = build_dedupe_key(
+            review.mall,
+            review.product_name,
+            review.review_date,
+            review.body,
+            review.title,
+        )
         if key and key in self.seen_keys:
             return True
         if key:
